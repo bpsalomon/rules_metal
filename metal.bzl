@@ -148,6 +148,7 @@ def _metal_binary_impl(ctx):
         args.add(src_metal.path)
         if ctx.var["COMPILATION_MODE"] == "dbg":
             args.add("-frecord-sources=flat")
+        args.add_all(ctx.attr.copts)
 
         apple_support.run(
             actions = ctx.actions,
@@ -186,6 +187,7 @@ metal_binary = rule(
         {
             "srcs": attr.label_list(allow_files = [".metal", ".h", ".hpp"]),
             "deps": attr.label_list(),
+            "copts": attr.string_list(),
         },
     ),
 )
