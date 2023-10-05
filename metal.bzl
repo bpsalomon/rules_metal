@@ -144,7 +144,8 @@ def _metal_binary_impl(ctx):
         args.add("-c")
 
         args.add("-o", air_file)
-        args.add_all("-I", trans_hdr_paths.to_list())
+        for path in trans_hdr_paths.to_list():
+            args.add("-I", path)
         args.add(src_metal.path)
         if ctx.var["COMPILATION_MODE"] == "dbg":
             args.add("-frecord-sources=flat")
