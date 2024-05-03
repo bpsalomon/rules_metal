@@ -134,6 +134,9 @@ def _metal_binary_impl(ctx):
 
     air_files = []
 
+    is_debug = ctx.var["COMPILATION_MODE"] == "dbg"
+    print(is_debug)
+
     for src_metal in srcs_metal_list:
         air_file = ctx.actions.declare_file(paths.replace_extension(src_metal.basename, ".air"))
         air_files.append(air_file)
@@ -143,12 +146,15 @@ def _metal_binary_impl(ctx):
         args.add("metal")
         args.add("-c")
 
+        if is_debug:
+            args.add("-frecord-sources")
+            args.add("-g")
+
         args.add("-o", air_file)
         for path in trans_hdr_paths.to_list():
             args.add("-I", path)
         args.add(src_metal.path)
-        if ctx.var["COMPILATION_MODE"] == "dbg":
-            args.add("-frecord-sources=flat")
+
         args.add_all(ctx.attr.copts)
 
         apple_support.run(
@@ -163,7 +169,11 @@ def _metal_binary_impl(ctx):
         )
 
     args = ctx.actions.args()
-    args.add("metallib")
+    args.add("metal")
+    if is_debug:
+        args.add("-frecord-sources")
+        args.add("-g")
+
     args.add("-o", metallib_file)
     args.add_all(air_files)
 
@@ -175,7 +185,7 @@ def _metal_binary_impl(ctx):
         outputs = [metallib_file],
         executable = "/usr/bin/xcrun",
         arguments = [args],
-        mnemonic = "MetallibCompile",
+        mnemonic = "MetallibLink",
     )
 
     return [DefaultInfo(files = depset([metallib_file]))]

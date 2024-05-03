@@ -1,4 +1,5 @@
 bazel-*
+MODULE.bazel.lock
 
 # macOS
 .DS_Store
