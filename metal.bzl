@@ -135,7 +135,6 @@ def _metal_binary_impl(ctx):
     air_files = []
 
     is_debug = ctx.var["COMPILATION_MODE"] == "dbg"
-    print(is_debug)
 
     for src_metal in srcs_metal_list:
         air_file = ctx.actions.declare_file(paths.replace_extension(src_metal.basename, ".air"))
