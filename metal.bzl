@@ -122,7 +122,10 @@ metal_library = rule(
 )
 
 def _metal_binary_impl(ctx):
-    metallib_file = ctx.actions.declare_file(ctx.label.name + ".metallib")
+    metallib_file = ctx.outputs.out
+    if metallib_file == None:
+        metallib_file = ctx.actions.declare_file(ctx.label.name + ".metallib")
+
     trans_srcs = get_transitive_srcs(ctx.files.srcs, ctx.attr.deps)
     trans_hdrs = get_transitive_hdrs([], ctx.attr.deps)
     trans_hdr_paths = get_transitive_hdr_paths([], ctx.attr.deps)
@@ -198,6 +201,7 @@ metal_binary = rule(
             "srcs": attr.label_list(allow_files = [".metal", ".h", ".hpp"]),
             "deps": attr.label_list(),
             "copts": attr.string_list(),
+            "out": attr.output(),
         },
     ),
 )
