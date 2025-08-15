@@ -1,4 +1,5 @@
 ###############################################################################
 module(name = "rules_metal")
-bazel_dep(name = "apple_support", version = "1.15.1", repo_name = "build_bazel_apple_support")
-bazel_dep(name = "bazel_skylib", version = "1.5.0")
+
+bazel_dep(name = "apple_support", version = "1.22.1", repo_name = "build_bazel_apple_support")
+bazel_dep(name = "bazel_skylib", version = "1.8.1")
