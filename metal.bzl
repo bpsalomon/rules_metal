@@ -93,8 +93,21 @@ def _process_hdrs(ctx, hdrs, include_prefix, strip_include_prefix):
 def _is_debug(ctx):
     return ctx.var["COMPILATION_MODE"] == "dbg"
 
+def _get_os_version_flag(ctx):
+    if ctx.fragments.apple.apple_platform_type == "ios":
+        if ctx.fragments.apple.ios_minimum_os_flag:
+            return "-mios-version-min={}".format(ctx.fragments.apple.ios_minimum_os_flag)
+        print(ctx.fragments.apple.ios_minimum_os_flag)
+    elif ctx.fragments.apple.apple_platform_type == "macos":
+        if ctx.fragments.apple.macos_minimum_os_flag:
+            return "-mmacos-version-min={}".format(ctx.fragments.apple.macos_minimum_os_flag)
+    return None
+
 def _compile_metals(metals, hdrs, hdr_paths, ctx):
+    _get_os_version_flag(ctx)
     air_files = []
+
+    version_flag = _get_os_version_flag(ctx)
 
     for src_metal in metals:
         air_file = ctx.actions.declare_file(paths.replace_extension(src_metal.basename, ".air"))
@@ -104,6 +117,8 @@ def _compile_metals(metals, hdrs, hdr_paths, ctx):
         args = ctx.actions.args()
         args.add("metal")
         args.add("-c")
+        if version_flag:
+            args.add(version_flag)
 
         if _is_debug(ctx):
             args.add("-frecord-sources")
@@ -192,6 +207,10 @@ def _metal_binary_impl(ctx):
     if _is_debug(ctx):
         args.add("-frecord-sources")
         args.add("-g")
+
+    version_flag = _get_os_version_flag(ctx)
+    if version_flag:
+        args.add(version_flag)
 
     args.add("-o", metallib_file)
     args.add_all(trans_airs)
