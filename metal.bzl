@@ -3,6 +3,7 @@
 load("@bazel_skylib//lib:dicts.bzl", "dicts")
 load("@bazel_skylib//lib:paths.bzl", "paths")
 load("@build_bazel_apple_support//lib:apple_support.bzl", "apple_support")
+load("@build_bazel_rules_swift//swift:swift.bzl", "swift_library")
 
 MetalFilesInfo = provider(
     "Collects Metal AIR files and headers",
@@ -122,7 +123,7 @@ def _compile_metals(metals, hdrs, hdr_paths, ctx):
 
         if _is_debug(ctx):
             args.add("-frecord-sources")
-            args.add("-g")
+            args.add("-gline-tables-only")
 
         args.add("-o", air_file)
         for path in hdr_paths.to_list():
@@ -206,7 +207,7 @@ def _metal_binary_impl(ctx):
     args.add("metal")
     if _is_debug(ctx):
         args.add("-frecord-sources")
-        args.add("-g")
+        args.add("-gline-tables-only")
 
     version_flag = _get_os_version_flag(ctx)
     if version_flag:
@@ -241,3 +242,315 @@ metal_binary = rule(
         },
     ),
 )
+
+MetalDebugInfo = provider(
+    doc = "Provider for collecting Metal binary targets",
+    fields = {
+        "targets": "depset of target label strings",
+    },
+)
+
+def _metal_debug_aspect_impl(target, ctx):
+    """Aspect that collects all metal_binary targets."""
+    metal_binaries = []
+
+    # Check if this target itself is a metal_binary (produces a .metallib file)
+    if hasattr(target, "files"):
+        for f in target.files.to_list():
+            if f.extension == "metallib":
+                metal_binaries.append(str(target.label))
+                break
+
+    # Collect metal binaries from dependencies (aspect handles recursion)
+    transitive_metal_binaries = []
+    if hasattr(ctx.rule.attr, "deps"):
+        for dep in ctx.rule.attr.deps:
+            if MetalDebugInfo in dep:
+                transitive_metal_binaries.append(dep[MetalDebugInfo].targets)
+
+    if hasattr(ctx.rule.attr, "data"):
+        for dep in ctx.rule.attr.data:
+            if MetalDebugInfo in dep:
+                transitive_metal_binaries.append(dep[MetalDebugInfo].targets)
+
+    if hasattr(ctx.rule.attr, "implementation_deps"):
+        for dep in ctx.rule.attr.implementation_deps:
+            if MetalDebugInfo in dep:
+                transitive_metal_binaries.append(dep[MetalDebugInfo].targets)
+
+    # Return a depset combining our findings with transitive ones
+    return [
+        MetalDebugInfo(
+            targets = depset(
+                direct = metal_binaries,
+                transitive = transitive_metal_binaries,
+            ),
+        ),
+    ]
+
+metal_debug_aspect = aspect(
+    implementation = _metal_debug_aspect_impl,
+    attr_aspects = ["deps", "data", "implementation_deps"],
+)
+
+def _xcode_metal_debug_helper_impl(ctx):
+    """Generates a script to create symlinks for Xcode GPU shader debugging."""
+
+    # Get all metallib targets from dependencies via the aspect
+    metallib_targets = []
+    for dep in ctx.attr.deps:
+        if MetalDebugInfo in dep:
+            metallib_targets.extend(dep[MetalDebugInfo].targets.to_list())
+
+    # Generate the script
+    script = ctx.actions.declare_file(ctx.label.name + ".sh")
+
+    script_content = """#!/bin/bash
+# Generated script to create symlinks for Xcode GPU shader debugging
+#
+# Usage:
+#   {script_name}                      # Interactive mode (prompts for temp dir)
+#   {script_name} <xcode_temp_directory>  # Direct mode (uses provided path)
+#
+# When Xcode captures a GPU frame and extracts Metal sources, run this script
+# with the temp directory path to create necessary symlinks for includes to resolve.
+#
+# Example:
+#   {script_name} /var/folders/.../T/780970914.71
+#
+# Metallibs used by this app:
+{metallib_list}
+
+set -e
+
+# Check if temp dir was provided as argument
+if [ -n "$1" ]; then
+    TEMP_DIR="$1"
+else
+    # Interactive mode - prompt for temp dir
+    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+    echo "  Xcode Metal GPU Shader Debugging Setup"
+    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+    echo ""
+    echo "Steps:"
+    echo "  1. Run your app from Xcode"
+    echo "  2. Capture GPU frame: Debug → Capture GPU Frame (⌘⌥G)"
+    echo "  3. Click on a shader to view it"
+    echo "  4. Copy the temp directory from any compile error"
+    echo ""
+    echo "The temp directory path looks like:"
+    echo "  /var/folders/.../T/780970914.71"
+    echo "            (copy up to here ^)"
+    echo ""
+    echo -n "Enter the temp directory path: "
+    read TEMP_DIR
+fi
+
+if [ -z "$TEMP_DIR" ]; then
+    echo "Error: No path provided"
+    exit 1
+fi
+
+if [ ! -d "$TEMP_DIR" ]; then
+    echo "Error: Directory does not exist: $TEMP_DIR"
+    echo ""
+    echo "Make sure you:"
+    echo "  - Captured a GPU frame first"
+    echo "  - Copied the full path up to /T/XXXXXX.XX"
+    exit 1
+fi
+
+echo "Creating symlinks for Xcode GPU shader debugging in: $TEMP_DIR"
+
+# Function to create symlinks in a directory
+# Prefers include directories in the same numbered subdirectory
+create_symlinks_in_dir() {{
+    local target_dir="$1"
+
+    # Extract the numbered subdirectory from target_dir (e.g., /path/src/HASH/0/... -> 0)
+    local target_subdir=$(echo "$target_dir" | sed -n 's#.*/src/[^/]*/\\([0-9]*\\)/.*#\\1#p')
+
+    # Find all include directories and create symlinks
+    # Process them so that include dirs in the same numbered subdir come first
+    find "$TEMP_DIR" -type d -name "include" | sort | while read -r include_path; do
+        lib_base=$(dirname "$include_path")
+        lib_name=$(basename "$lib_base")
+
+        # Extract numbered subdirectory from this include path
+        local include_subdir=$(echo "$include_path" | sed -n 's#.*/src/[^/]*/\\([0-9]*\\)/.*#\\1#p')
+
+        # Determine virtual prefix (e.g., "applelib" -> "apple", "drawlib" -> "draw")
+        case "$lib_name" in
+            *lib) virtual_name="${{lib_name%lib}}" ;;
+            *) virtual_name="$lib_name" ;;
+        esac
+
+        # If symlink doesn't exist, create it
+        # If it exists but points to different subdir and we have matching subdir, replace it
+        if [ ! -e "$target_dir/$virtual_name" ]; then
+            ln -sf "$include_path" "$target_dir/$virtual_name"
+            echo "  Created symlink: $target_dir/$virtual_name -> $include_path"
+        elif [ "$target_subdir" = "$include_subdir" ]; then
+            # This include is in the same numbered subdirectory, prefer it
+            current_target=$(readlink "$target_dir/$virtual_name" 2>/dev/null || echo "")
+            current_subdir=$(echo "$current_target" | sed -n 's#.*/src/[^/]*/\\([0-9]*\\)/.*#\\1#p')
+            if [ "$current_subdir" != "$target_subdir" ]; then
+                rm -f "$target_dir/$virtual_name"
+                ln -sf "$include_path" "$target_dir/$virtual_name"
+                echo "  Updated symlink: $target_dir/$virtual_name -> $include_path (same subdirectory)"
+            fi
+        fi
+    done
+}}
+
+# Find all directories containing .metal files and create symlinks
+find "$TEMP_DIR" -type f -name "*.metal" | while read -r metalfile; do
+    msldir=$(dirname "$metalfile")
+
+    # Skip if we've already processed this directory
+    if [ -f "$msldir/.symlinks_created" ]; then
+        continue
+    fi
+
+    echo "Processing: $msldir"
+
+    # Create symlinks in this directory
+    create_symlinks_in_dir "$msldir"
+
+    # Also create symlinks in the shared/ subdirectory if it exists
+    if [ -d "$msldir/shared" ]; then
+        create_symlinks_in_dir "$msldir/shared"
+    fi
+
+    # Mark this directory as processed
+    touch "$msldir/.symlinks_created"
+done
+
+echo ""
+echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+echo "  Setup complete! Go back to Xcode and view your shader."
+echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+echo ""
+""".format(
+        script_name = script.short_path,
+        metallib_list = "\n".join(["#   - " + t for t in metallib_targets]),
+    )
+
+    ctx.actions.write(
+        output = script,
+        content = script_content,
+        is_executable = True,
+    )
+
+    return [DefaultInfo(
+        files = depset([script]),
+        executable = script,
+    )]
+
+_xcode_metal_debug_helper = rule(
+    implementation = _xcode_metal_debug_helper_impl,
+    attrs = {
+        "deps": attr.label_list(aspects = [metal_debug_aspect]),
+    },
+    executable = True,
+)
+
+def cc_binary_with_metal_debug(name, **kwargs):
+    """Wrapper for cc_binary that adds Xcode GPU shader debugging support.
+
+    Args:
+        name: Name of the binary
+        **kwargs: All other arguments passed to cc_binary
+
+    Usage:
+        cc_binary_with_metal_debug(
+            name = "my_app",
+            srcs = ["main.cpp"],
+            deps = [...],
+        )
+
+        # Then run: bazel run //path/to:my_app_copy_metal_hdrs_to_trace
+    """
+    native.cc_binary(name = name, **kwargs)
+    metal_debug_script(
+        name = name + "_copy_metal_hdrs_to_trace",
+        deps = kwargs.get("deps", []) + kwargs.get("data", []),
+    )
+
+def cc_library_with_metal_debug(name, **kwargs):
+    """Wrapper for cc_library that adds Xcode GPU shader debugging support.
+
+    Args:
+        name: Name of the library
+        **kwargs: All other arguments passed to cc_library
+
+    Usage:
+        cc_library_with_metal_debug(
+            name = "my_lib",
+            srcs = ["lib.cpp"],
+            deps = [...],
+        )
+
+        # Then run: bazel run //path/to:my_lib_copy_metal_hdrs_to_trace
+    """
+    native.cc_library(name = name, **kwargs)
+    metal_debug_script(
+        name = name + "_copy_metal_hdrs_to_trace",
+        deps = kwargs.get("deps", []) + kwargs.get("data", []),
+    )
+
+def swift_library_with_metal_debug(name, **kwargs):
+    """Wrapper for swift_library that adds Xcode GPU shader debugging support.
+
+    Args:
+        name: Name of the library
+        **kwargs: All other arguments passed to swift_library
+
+    Usage:
+        load("@rules_metal//:metal.bzl", "swift_library_with_metal_debug")
+
+        swift_library_with_metal_debug(
+            name = "MyLib",
+            srcs = ["MyLib.swift"],
+            deps = [...],
+        )
+
+        # Then run: bazel run //path/to:MyLib_copy_metal_hdrs_to_trace
+    """
+    swift_library(name = name, **kwargs)
+    metal_debug_script(
+        name = name + "_copy_metal_hdrs_to_trace",
+        deps = kwargs.get("deps", []) + kwargs.get("data", []),
+    )
+
+def metal_debug_script(name, deps):
+    """Creates Xcode GPU debug helper script(s) for existing targets.
+
+    This is useful for Apple application targets (macos_application, ios_application, etc.)
+    that can't use cc_binary_with_metal_debug.
+
+    Args:
+        name: Base name for the debug targets (e.g., "MyApp_copy_metal_hdrs_to_trace")
+        deps: Dependencies to scan for metal binaries
+
+    Creates:
+        - {name}: The debug script (supports both interactive and direct modes)
+
+    Usage:
+        macos_application(
+            name = "MyApp",
+            deps = ["MyAppLib"],
+        )
+
+        metal_debug_script(
+            name = "MyApp_copy_metal_hdrs_to_trace",
+            deps = ["MyAppLib"],
+        )
+
+        # Run from command line (auto-rebuilds and prompts for temp dir):
+        bazel run //path/to:MyApp_copy_metal_hdrs_to_trace
+    """
+    _xcode_metal_debug_helper(
+        name = name,
+        deps = deps,
+    )
