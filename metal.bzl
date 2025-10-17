@@ -474,7 +474,7 @@ def cc_binary_with_metal_debug(name, **kwargs):
     native.cc_binary(name = name, **kwargs)
     metal_debug_script(
         name = name + "_copy_metal_hdrs_to_trace",
-        deps = kwargs.get("deps", []) + kwargs.get("data", []),
+        deps = kwargs.get("deps", []),
     )
 
 def cc_library_with_metal_debug(name, **kwargs):
@@ -496,7 +496,7 @@ def cc_library_with_metal_debug(name, **kwargs):
     native.cc_library(name = name, **kwargs)
     metal_debug_script(
         name = name + "_copy_metal_hdrs_to_trace",
-        deps = kwargs.get("deps", []) + kwargs.get("data", []),
+        deps = kwargs.get("deps", []),
     )
 
 def swift_library_with_metal_debug(name, **kwargs):
@@ -520,7 +520,7 @@ def swift_library_with_metal_debug(name, **kwargs):
     swift_library(name = name, **kwargs)
     metal_debug_script(
         name = name + "_copy_metal_hdrs_to_trace",
-        deps = kwargs.get("deps", []) + kwargs.get("data", []),
+        deps = kwargs.get("deps", []),
     )
 
 def metal_debug_script(name, deps):
