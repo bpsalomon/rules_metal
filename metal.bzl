@@ -4,6 +4,7 @@ load("@bazel_skylib//lib:dicts.bzl", "dicts")
 load("@bazel_skylib//lib:paths.bzl", "paths")
 load("@build_bazel_apple_support//lib:apple_support.bzl", "apple_support")
 load("@build_bazel_rules_swift//swift:swift.bzl", "swift_library")
+load("@rules_xcodeproj//xcodeproj/internal:providers.bzl", "XcodeProjExtraFilesHintInfo")
 
 MetalFilesInfo = provider(
     "Collects Metal AIR files and headers",
@@ -164,13 +165,15 @@ def _metal_library_impl(ctx):
 
     trans_airs = get_transitive_airs(air_files, ctx.attr.deps)
 
-    return [MetalFilesInfo(
-        transitive_airs = trans_airs,
-        transitive_headers = trans_hdrs,
-        transitive_header_paths = trans_hdr_paths,
-    )]
+    return [
+        MetalFilesInfo(
+            transitive_airs = trans_airs,
+            transitive_headers = trans_hdrs,
+            transitive_header_paths = trans_hdr_paths,
+        ),
+    ]
 
-metal_library = rule(
+_metal_library_rule = rule(
     implementation = _metal_library_impl,
     fragments = ["apple"],
     attrs = dicts.add(
@@ -185,6 +188,41 @@ metal_library = rule(
         },
     ),
 )
+
+def metal_library(
+        name,
+        srcs = [],
+        hdrs = [],
+        deps = [],
+        copts = [],
+        include_prefix = "",
+        strip_include_prefix = "",
+        visibility = None,
+        **kwargs):
+    """Creates a metal_library target that compiles Metal shading language code into reusable libraries.
+
+    Args:
+        name: Name of the library
+        srcs: Metal source files (.metal)
+        hdrs: Metal header files (.h, .hpp)
+        deps: Other metal_library targets this library depends on
+        copts: Compiler options passed to metal compiler
+        include_prefix: Optional prefix to add to include paths
+        strip_include_prefix: Optional prefix to strip from include paths
+        visibility: Target visibility
+        **kwargs: Additional arguments passed to the underlying rule
+    """
+    _metal_library_rule(
+        name = name,
+        srcs = srcs,
+        hdrs = hdrs,
+        deps = deps,
+        copts = copts,
+        include_prefix = include_prefix,
+        strip_include_prefix = strip_include_prefix,
+        visibility = visibility,
+        **kwargs
+    )
 
 def _metal_binary_impl(ctx):
     metallib_file = ctx.outputs.out
@@ -229,7 +267,7 @@ def _metal_binary_impl(ctx):
 
     return [DefaultInfo(files = depset([metallib_file]))]
 
-metal_binary = rule(
+_metal_binary_rule = rule(
     implementation = _metal_binary_impl,
     fragments = ["apple"],
     attrs = dicts.add(
@@ -242,6 +280,35 @@ metal_binary = rule(
         },
     ),
 )
+
+def metal_binary(
+        name,
+        srcs = [],
+        deps = [],
+        copts = [],
+        out = None,
+        visibility = None,
+        **kwargs):
+    """Creates a metal_binary target that compiles and links Metal code into a .metallib file.
+
+    Args:
+        name: Name of the binary
+        srcs: Metal source files (.metal) and headers (.h, .hpp)
+        deps: metal_library targets this binary depends on
+        copts: Compiler options passed to metal compiler
+        out: Output .metallib filename (defaults to name.metallib)
+        visibility: Target visibility
+        **kwargs: Additional arguments passed to the underlying rule
+    """
+    _metal_binary_rule(
+        name = name,
+        srcs = srcs,
+        deps = deps,
+        copts = copts,
+        out = out,
+        visibility = visibility,
+        **kwargs
+    )
 
 MetalDebugInfo = provider(
     doc = "Provider for collecting Metal binary targets",
@@ -455,8 +522,54 @@ _xcode_metal_debug_helper = rule(
     executable = True,
 )
 
+def _add_metal_xcode_integration(name, kwargs):
+    """Helper function to add automatic Metal source visibility for Xcode projects.
+
+    Scans data and deps for Metal targets, collects their transitive sources,
+    and attaches them as aspect_hints for rules_xcodeproj integration.
+
+    Args:
+        name: Name of the target
+        kwargs: Target's kwargs dict (will be modified to add aspect_hints)
+
+    Returns:
+        Modified kwargs dict
+    """
+    # Collect both data and regular dependencies to scan for Metal binaries
+    # Filter out source files from data (only include rule targets)
+    targets_to_scan = []
+    for item in kwargs.get("data", []):
+        # Only include if it looks like a target (starts with : or //) and doesn't look like a file
+        # Skip items that look like files (contain a dot in the last component)
+        if type(item) == "string":
+            item_str = str(item)
+            # Get the last component after / or :
+            last_component = item_str.split("/")[-1].split(":")[-1]
+            # If it doesn't contain a dot (likely not a file), include it
+            if "." not in last_component:
+                targets_to_scan.append(item)
+    targets_to_scan.extend(kwargs.get("deps", []))
+
+    # If there are any dependencies, create a transitive_metal_extra_files target
+    # and attach it as an aspect_hint for Xcode project integration
+    if targets_to_scan:
+        metal_hint_name = name + "_metal_sources"
+        transitive_metal_extra_files(
+            name = metal_hint_name,
+            targets = targets_to_scan,
+        )
+
+        # Get existing aspect_hints and add our metal sources hint
+        aspect_hints = kwargs.pop("aspect_hints", [])
+        kwargs["aspect_hints"] = aspect_hints + [":" + metal_hint_name]
+
+    return kwargs
+
 def cc_binary_with_metal_debug(name, **kwargs):
-    """Wrapper for cc_binary that adds Xcode GPU shader debugging support.
+    """Wrapper for cc_binary that adds Xcode GPU shader debugging support and automatic Metal source visibility.
+
+    This macro automatically collects all transitive Metal sources from data and regular dependencies
+    and makes them visible in the Xcode project navigator.
 
     Args:
         name: Name of the binary
@@ -466,11 +579,13 @@ def cc_binary_with_metal_debug(name, **kwargs):
         cc_binary_with_metal_debug(
             name = "my_app",
             srcs = ["main.cpp"],
-            deps = [...],
+            data = [":shaders"],  # Metal sources will automatically appear in Xcode
+            deps = [...],  # Will also scan deps for Metal sources
         )
 
         # Then run: bazel run //path/to:my_app_copy_metal_hdrs_to_trace
     """
+    kwargs = _add_metal_xcode_integration(name, kwargs)
     native.cc_binary(name = name, **kwargs)
     metal_debug_script(
         name = name + "_copy_metal_hdrs_to_trace",
@@ -478,7 +593,10 @@ def cc_binary_with_metal_debug(name, **kwargs):
     )
 
 def cc_library_with_metal_debug(name, **kwargs):
-    """Wrapper for cc_library that adds Xcode GPU shader debugging support.
+    """Wrapper for cc_library that adds Xcode GPU shader debugging support and automatic Metal source visibility.
+
+    This macro automatically collects all transitive Metal sources from data and regular dependencies
+    and makes them visible in the Xcode project navigator.
 
     Args:
         name: Name of the library
@@ -488,11 +606,13 @@ def cc_library_with_metal_debug(name, **kwargs):
         cc_library_with_metal_debug(
             name = "my_lib",
             srcs = ["lib.cpp"],
-            deps = [...],
+            data = [":shaders"],  # Metal sources will automatically appear in Xcode
+            deps = [...],  # Will also scan deps for Metal sources
         )
 
         # Then run: bazel run //path/to:my_lib_copy_metal_hdrs_to_trace
     """
+    kwargs = _add_metal_xcode_integration(name, kwargs)
     native.cc_library(name = name, **kwargs)
     metal_debug_script(
         name = name + "_copy_metal_hdrs_to_trace",
@@ -500,7 +620,10 @@ def cc_library_with_metal_debug(name, **kwargs):
     )
 
 def swift_library_with_metal_debug(name, **kwargs):
-    """Wrapper for swift_library that adds Xcode GPU shader debugging support.
+    """Wrapper for swift_library that adds Xcode GPU shader debugging support and automatic Metal source visibility.
+
+    This macro automatically collects all transitive Metal sources from data and regular dependencies
+    and makes them visible in the Xcode project navigator.
 
     Args:
         name: Name of the library
@@ -512,11 +635,13 @@ def swift_library_with_metal_debug(name, **kwargs):
         swift_library_with_metal_debug(
             name = "MyLib",
             srcs = ["MyLib.swift"],
-            deps = [...],
+            data = [":shaders"],  # Metal sources will automatically appear in Xcode
+            deps = [...],  # Will also scan deps for Metal sources
         )
 
         # Then run: bazel run //path/to:MyLib_copy_metal_hdrs_to_trace
     """
+    kwargs = _add_metal_xcode_integration(name, kwargs)
     swift_library(name = name, **kwargs)
     metal_debug_script(
         name = name + "_copy_metal_hdrs_to_trace",
@@ -554,3 +679,140 @@ def metal_debug_script(name, deps):
         name = name,
         deps = deps,
     )
+
+# Rule for exposing extra files to rules_xcodeproj via aspect_hints
+# This is compatible with rules_xcodeproj's xcodeproj_extra_files feature
+
+def _metal_extra_files_impl(ctx):
+    """Implementation for metal_extra_files rule."""
+    return [XcodeProjExtraFilesHintInfo(files = depset(ctx.files.files))]
+
+metal_extra_files = rule(
+    doc = """Surfaces extra Metal source files for inclusion in Xcode project navigator.
+
+    This rule is compatible with rules_xcodeproj's xcodeproj_extra_files feature.
+    Attach to metal_library or metal_binary targets via aspect_hints attribute.
+
+    Example:
+        metal_extra_files(
+            name = "shaders_xcode_hint",
+            files = ["shader.metal", "types.h"],
+        )
+
+        metal_binary(
+            name = "shaders",
+            srcs = ["shader.metal", "types.h"],
+            aspect_hints = [":shaders_xcode_hint"],
+        )
+    """,
+    implementation = _metal_extra_files_impl,
+    attrs = {
+        "files": attr.label_list(
+            doc = "The list of Metal source files to surface in the Xcode navigator",
+            allow_files = [".metal", ".h", ".hpp"],
+        ),
+    },
+    provides = [XcodeProjExtraFilesHintInfo],
+)
+
+# Provider for collecting transitive Metal sources
+_MetalSourcesInfo = provider(
+    doc = "Provider for collecting transitive Metal source files",
+    fields = {
+        "srcs": "Depset of Metal source files",
+        "hdrs": "Depset of Metal header files",
+    },
+)
+
+def _metal_sources_aspect_impl(target, ctx):
+    """Aspect that collects transitive Metal sources from metal_library and metal_binary targets."""
+    srcs = []
+    hdrs = []
+    transitive_srcs = []
+    transitive_hdrs = []
+
+    # Collect from this target if it's a metal_library or metal_binary
+    if hasattr(ctx.rule.attr, "srcs"):
+        for src in ctx.rule.attr.srcs:
+            if hasattr(src, "files"):
+                for f in src.files.to_list():
+                    if f.extension in ["metal"]:
+                        srcs.append(f)
+                    elif f.extension in ["h", "hpp"]:
+                        hdrs.append(f)
+
+    if hasattr(ctx.rule.attr, "hdrs"):
+        for hdr in ctx.rule.attr.hdrs:
+            if hasattr(hdr, "files"):
+                for f in hdr.files.to_list():
+                    if f.extension in ["h", "hpp"]:
+                        hdrs.append(f)
+
+    # Collect from deps
+    if hasattr(ctx.rule.attr, "deps"):
+        for dep in ctx.rule.attr.deps:
+            if _MetalSourcesInfo in dep:
+                transitive_srcs.append(dep[_MetalSourcesInfo].srcs)
+                transitive_hdrs.append(dep[_MetalSourcesInfo].hdrs)
+
+    # Collect from data dependencies
+    if hasattr(ctx.rule.attr, "data"):
+        for dep in ctx.rule.attr.data:
+            if _MetalSourcesInfo in dep:
+                transitive_srcs.append(dep[_MetalSourcesInfo].srcs)
+                transitive_hdrs.append(dep[_MetalSourcesInfo].hdrs)
+
+    # Collect from implementation_deps (used by cc_library targets)
+    if hasattr(ctx.rule.attr, "implementation_deps"):
+        for dep in ctx.rule.attr.implementation_deps:
+            if _MetalSourcesInfo in dep:
+                transitive_srcs.append(dep[_MetalSourcesInfo].srcs)
+                transitive_hdrs.append(dep[_MetalSourcesInfo].hdrs)
+
+    return [_MetalSourcesInfo(
+        srcs = depset(direct = srcs, transitive = transitive_srcs),
+        hdrs = depset(direct = hdrs, transitive = transitive_hdrs),
+    )]
+
+_metal_sources_aspect = aspect(
+    implementation = _metal_sources_aspect_impl,
+    attr_aspects = ["deps", "data", "implementation_deps"],
+)
+
+def _transitive_metal_extra_files_impl(ctx):
+    """Collects all transitive Metal sources from a metal_binary and creates XcodeProjExtraFilesHintInfo."""
+    all_files = []
+
+    for target in ctx.attr.targets:
+        if _MetalSourcesInfo in target:
+            all_files.extend(target[_MetalSourcesInfo].srcs.to_list())
+            all_files.extend(target[_MetalSourcesInfo].hdrs.to_list())
+
+    return [XcodeProjExtraFilesHintInfo(files = depset(all_files))]
+
+transitive_metal_extra_files = rule(
+    doc = """Collects transitive Metal sources and exposes them for Xcode project navigator.
+
+    Use this to surface all Metal sources from a metal_binary and its dependencies.
+
+    Example:
+        transitive_metal_extra_files(
+            name = "all_metal_sources",
+            targets = [":shaders"],
+        )
+
+        swift_library(
+            name = "MyLib",
+            ...
+            aspect_hints = [":all_metal_sources"],
+        )
+    """,
+    implementation = _transitive_metal_extra_files_impl,
+    attrs = {
+        "targets": attr.label_list(
+            doc = "Metal targets to collect sources from (typically metal_binary targets)",
+            aspects = [_metal_sources_aspect],
+        ),
+    },
+    provides = [XcodeProjExtraFilesHintInfo],
+)
